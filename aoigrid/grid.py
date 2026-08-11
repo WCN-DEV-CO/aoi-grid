@@ -1,135 +1,92 @@
 """
-aoigrid.grid — uniform spatial hash grid for neighbor / AoI queries.
-
-Classic, well-understood technique: bucket entities into fixed-size cells,
-then answer "neighbors within radius" by only scanning the cells that
-overlap the query area. Pure standard library, 2D or 3D.
-
-This is a general-purpose spatial primitive — useful for crowd rendering,
-collision broad-phase, flocking, proximity chat, interest management, etc.
+Spatial hash grid for efficient 2D/3D neighbor queries.
+O(1) insert, O(k) neighbor lookup where k = nearby cells.
 """
-from __future__ import annotations
-
+from typing import List, Tuple, Dict, Optional, Any
+from dataclasses import dataclass, field
 import math
-from typing import Dict, Hashable, List, Optional, Tuple
+
+
+@dataclass
+class GridCell:
+    key: Tuple[int, ...]
+    items: List[Any] = field(default_factory=list)
 
 
 class SpatialGrid:
-    """
-    A uniform spatial hash grid.
+    """Uniform spatial hash grid for 2D or 3D spatial queries."""
 
-    cell_size: width of each grid cell (tune ~= your typical query radius).
-    dims:      2 or 3.
-    """
-
-    def __init__(self, cell_size: float, dims: int = 2) -> None:
-        if dims not in (2, 3):
-            raise ValueError("dims must be 2 or 3")
-        if cell_size <= 0:
-            raise ValueError("cell_size must be > 0")
+    def __init__(self, cell_size: float, dimensions: int = 2):
         self.cell_size = float(cell_size)
-        self.dims = dims
-        self._cells: Dict[Tuple[int, ...], Dict[Hashable, Tuple[float, ...]]] = {}
-        self._pos: Dict[Hashable, Tuple[float, ...]] = {}
+        self.dimensions = dimensions
+        self.cells: Dict[Tuple[int, ...], GridCell] = {}
 
-    def _key(self, pos: Tuple[float, ...]) -> Tuple[int, ...]:
-        cs = self.cell_size
-        return tuple(int(math.floor(c / cs)) for c in pos[: self.dims])
+    def _hash(self, point: Tuple[float, ...]) -> Tuple[int, ...]:
+        return tuple(int(math.floor(p / self.cell_size)) for p in point[:self.dimensions])
 
-    def insert(self, entity_id: Hashable, pos: Tuple[float, ...]) -> None:
-        """Insert or move an entity to a position."""
-        if entity_id in self._pos:
-            self.remove(entity_id)
-        pos = tuple(float(c) for c in pos[: self.dims])
-        key = self._key(pos)
-        self._cells.setdefault(key, {})[entity_id] = pos
-        self._pos[entity_id] = pos
+    def insert(self, item: Any, position: Tuple[float, ...]):
+        key = self._hash(position)
+        if key not in self.cells:
+            self.cells[key] = GridCell(key=key)
+        self.cells[key].items.append((item, position))
 
-    # convenience alias — inserting an existing id moves it
-    move = insert
+    def remove(self, item: Any, position: Tuple[float, ...]):
+        key = self._hash(position)
+        if key in self.cells:
+            self.cells[key].items = [(i, p) for i, p in self.cells[key].items if i != item]
 
-    def remove(self, entity_id: Hashable) -> None:
-        """Remove an entity from the grid."""
-        pos = self._pos.pop(entity_id, None)
-        if pos is None:
-            return
-        key = self._key(pos)
-        bucket = self._cells.get(key)
-        if bucket:
-            bucket.pop(entity_id, None)
-            if not bucket:
-                del self._cells[key]
+    def query_radius(self, center: Tuple[float, ...], radius: float) -> List[Any]:
+        """Return all items within radius of center."""
+        results = []
+        center_hash = self._hash(center)
+        cell_range = int(math.ceil(radius / self.cell_size))
+        for dx in range(-cell_range, cell_range + 1):
+            for dy in range(-cell_range, cell_range + 1):
+                if self.dimensions == 3:
+                    for dz in range(-cell_range, cell_range + 1):
+                        key = (center_hash[0]+dx, center_hash[1]+dy, center_hash[2]+dz)
+                        if key in self.cells:
+                            for item, pos in self.cells[key].items:
+                                dist = math.sqrt(sum((p - c) ** 2 for p, c in zip(pos[:self.dimensions], center[:self.dimensions])))
+                                if dist <= radius:
+                                    results.append(item)
+                else:
+                    key = (center_hash[0]+dx, center_hash[1]+dy)
+                    if key in self.cells:
+                        for item, pos in self.cells[key].items:
+                            dist = math.sqrt(sum((p - c) ** 2 for p, c in zip(pos[:2], center[:2])))
+                            if dist <= radius:
+                                results.append(item)
+        return results
 
-    def _cell_range(self, pos, radius):
-        cs = self.cell_size
-        spans = []
-        for i in range(self.dims):
-            lo = int(math.floor((pos[i] - radius) / cs))
-            hi = int(math.floor((pos[i] + radius) / cs))
-            spans.append(range(lo, hi + 1))
-        return spans
+    def query_nearest(self, center: Tuple[float, ...], k: int = 1) -> List[Tuple[Any, float]]:
+        """Return k nearest items as (item, distance) tuples."""
+        all_items = self.query_radius(center, self.cell_size * 10)
+        scored = []
+        for item in all_items:
+            # Need position — find it
+            for cell in self.cells.values():
+                for i, pos in cell.items:
+                    if i == item:
+                        dist = math.sqrt(sum((p - c) ** 2 for p, c in zip(pos[:self.dimensions], center[:self.dimensions])))
+                        scored.append((item, dist))
+                        break
+        scored.sort(key=lambda x: x[1])
+        return scored[:k]
 
-    def query_radius(self, pos: Tuple[float, ...], radius: float,
-                     exclude: Optional[Hashable] = None) -> List[Hashable]:
-        """Return entity ids within `radius` of `pos` (any-dim Euclidean)."""
-        pos = tuple(float(c) for c in pos[: self.dims])
-        r2 = radius * radius
-        spans = self._cell_range(pos, radius)
-        found: List[Hashable] = []
+    def clear(self):
+        self.cells.clear()
 
-        if self.dims == 2:
-            for cx in spans[0]:
-                for cy in spans[1]:
-                    bucket = self._cells.get((cx, cy))
-                    if not bucket:
-                        continue
-                    for eid, ep in bucket.items():
-                        if eid == exclude:
-                            continue
-                        dx = ep[0] - pos[0]; dy = ep[1] - pos[1]
-                        if dx * dx + dy * dy <= r2:
-                            found.append(eid)
-        else:
-            for cx in spans[0]:
-                for cy in spans[1]:
-                    for cz in spans[2]:
-                        bucket = self._cells.get((cx, cy, cz))
-                        if not bucket:
-                            continue
-                        for eid, ep in bucket.items():
-                            if eid == exclude:
-                                continue
-                            dx = ep[0] - pos[0]; dy = ep[1] - pos[1]; dz = ep[2] - pos[2]
-                            if dx * dx + dy * dy + dz * dz <= r2:
-                                found.append(eid)
-        return found
+    def __len__(self):
+        return sum(len(c.items) for c in self.cells.values())
 
-    def nearest(self, pos: Tuple[float, ...], k: int,
-                exclude: Optional[Hashable] = None,
-                max_radius: Optional[float] = None) -> List[Hashable]:
-        """
-        Return the k nearest entity ids to `pos`, closest first.
 
-        Expands the search radius outward in cell-sized rings until at least
-        k candidates are found (or max_radius is hit), then sorts by distance.
-        Ideal for "show me the N closest players/objects" interest management.
-        """
-        pos = tuple(float(c) for c in pos[: self.dims])
-        radius = self.cell_size
-        cap = max_radius if max_radius is not None else self.cell_size * 64
-        candidates: List[Hashable] = []
-        while True:
-            candidates = self.query_radius(pos, radius, exclude=exclude)
-            if len(candidates) >= k or radius >= cap:
-                break
-            radius *= 2
-
-        def d2(eid):
-            ep = self._pos[eid]
-            return sum((ep[i] - pos[i]) ** 2 for i in range(self.dims))
-
-        candidates.sort(key=d2)
-        return candidates[:k]
-
-    def __len__(self) -> int:
-        return len(self._pos)
+if __name__ == "__main__":
+    grid = SpatialGrid(cell_size=10.0, dimensions=2)
+    grid.insert("player", (5, 5))
+    grid.insert("enemy1", (8, 3))
+    grid.insert("enemy2", (50, 50))
+    grid.insert("npc", (12, 8))
+    nearby = grid.query_radius((5, 5), radius=15)
+    print(f"Items within 15 of (5,5): {nearby}")
+    print(f"Total items in grid: {len(grid)}")
